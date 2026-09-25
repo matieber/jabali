@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.env
+.venv
+*.pt
+env/
+venv/
+
+# archivos temporales/inputs
+temp_frames/
+FotoTrampeo/
+jsons/
+temp_detections.json
+
+# outputs
+especies_resultados_finales.json
+reporte_detecciones.xlsx
+resultados_deteccion.json
+
+# tests locales
+temp_frames_v1/
+frames_1/
+OLD/
+filepaths_procesados.txt
+comando.txt
