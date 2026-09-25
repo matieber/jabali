@@ -12,7 +12,7 @@
 * **`preprocesamiento.py`**  
   Encargado de la preparación de datos. Indexa los videos y los JSONs de MegaDetector mediante una clave única (`SL---/fecha/video`). Lee las detecciones, filtra únicamente los frames con presencia de animales (categoría `1`) y utiliza OpenCV para extraer solo esos fotogramas a la carpeta `temp_frames/`. Finalmente, reestructura y guarda el archivo `temp_detections.json` con el formato exacto exigido por SpeciesNet.
 
-  > **Configuración requerida:** hay que definir e ingresar las rutas hacia las carpetas de videos (`VIDEOS_DIR`) y JSONs de MegaDetector (`JSONS_DIR`) directamente dentro del script `preprocesamiento.py` antes de la primera ejecución.
+  > **Configuración requerida:** hay que definir e ingresar las rutas hacia las carpetas de videos (`VIDEOS_DIR`) y JSONs de MegaDetector (`JSONS_DIR`) directamente dentro del script `preprocesamiento.py` antes de la primera ejecución. También se debe modificar la variable global `UMB_CONF`; para cada frame, se verifica que su json del analisis de Mega Detector correspondiente presente una confianza de detección tal que confianza>=UMB_CONF. Si no se cumple la condición, el frame no es procesado por SpeciesNet.
 
 * **`main.py`**  
   Corre Species Net. Lee `temp_detections.json` y verifica la existencia física de cada fotograma en el disco (`os.path.isfile`). Si se movieron o eliminaron imágenes manualmente de la carpeta temporal (temp_frames), el script evita procesarlas. Luego prepara el mapa de instancias con la geolocalización correspondiente (`ARG`) y ejecuta SpeciesNet para generar el archivo con los resultados de la clasificación.
