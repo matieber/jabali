@@ -16,10 +16,12 @@ venv/
 # archivos temporales/inputs
 temp_frames/
 FotoTrampeo/
+FotosCamarasTrampas/
 jsons/
 result/
 rclone_local/
 temp_detections.json
+*.out
 
 # outputs
 especies_resultados_finales.json
