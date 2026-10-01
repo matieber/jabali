@@ -6,6 +6,15 @@ import csv
 import cv2
 import json
 import time
+import os
+import threading
+
+# hay que instalar psutil si se requiere benchmarking
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,7 +51,28 @@ METADATA_FILE = RESULTS_DIR / "processing_metadata.csv"
 TMP_DETECTIONS = RESULTS_DIR / "_tmp_detections.json"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov"}
-METADATA_FIELDS = ["video_path", "status", "reason", "detection_json", "result_json"]
+METADATA_FIELDS = [
+    "video_path",
+    "status",
+    "reason",
+    "detection_json",
+    "result_json",
+    "download_seconds",
+    "extract_seconds",
+    "megadetector_seconds",
+    "speciesnet_seconds",
+    "processing_seconds",
+    "total_seconds",
+    "frames_extracted",
+    "detections",
+    "classified_detections",
+    "ram_start_mb",
+    "ram_peak_mb",
+    "ram_end_mb",
+    "cpu_avg_percent",
+    "cpu_peak_percent",
+    "gpu_peak_mb",
+]
 
 RCLONE_CMD = shutil.which("rclone")
 
@@ -53,6 +83,13 @@ CLASSIFY_THRESHOLD = mdsn.DEFAULT_DETECTION_CONFIDENCE_THRESHOLD_FOR_CLASSIFICAT
 
 # Segundos entre chequeos de errores en los hilos de crops.
 QUEUE_POLL_SECONDS = 5
+
+# Timeout máximo para una descarga individual mediante rclone.
+# Evita que un rclone bloqueado deje detenido todo el pipeline indefinidamente.
+DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
+
+# Intervalo de muestreo para las métricas de recursos del proceso.
+BENCHMARK_SAMPLE_SECONDS = 0.5
 
 # ==============================================================================
 # ARGUMENTOS
@@ -212,21 +249,147 @@ def images_to_classify(detector_results):
 # ==============================================================================
 
 
-def log_result(stats, video_path, status, reason="", detection_json=None, result_json=None):
-    """ Registra el estado final de un video en el archivo CSV de metadatos. """
+def log_result(
+    stats,
+    video_path,
+    status,
+    reason="",
+    detection_json=None,
+    result_json=None,
+    metrics=None,
+):
+    """Registra el estado final y las métricas de un video en el CSV."""
     is_new = not METADATA_FILE.exists()
+    metrics = metrics or {}
+
     with METADATA_FILE.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=METADATA_FIELDS)
         if is_new:
             writer.writeheader()
-        writer.writerow({
+
+        row = {
             "video_path": video_path,
             "status": status,
             "reason": reason,
             "detection_json": str(Path(detection_json).resolve()) if detection_json else "",
             "result_json": str(Path(result_json).resolve()) if result_json else "",
-        })
+        }
+
+        for field in METADATA_FIELDS[5:]:
+            row[field] = metrics.get(field, "")
+
+        writer.writerow(row)
+
     stats[status] += 1
+
+
+class BenchmarkMonitor:
+    """Mide tiempo, CPU, RAM y VRAM del proceso durante un video."""
+
+    def __init__(self, sample_seconds=BENCHMARK_SAMPLE_SECONDS):
+        self.process = psutil.Process(os.getpid()) if psutil else None
+        self.sample_seconds = sample_seconds
+        self.start_time = None
+        self.ram_start_mb = 0.0
+        self.peak_ram_mb = 0.0
+        self.cpu_samples = []
+        self.cpu_peak_percent = 0.0
+        self.gpu_peak_mb = 0.0
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self.start_time = time.perf_counter()
+
+        if self.process is None:
+            return
+
+        try:
+            self.ram_start_mb = self.process.memory_info().rss / (1024 ** 2)
+            self.peak_ram_mb = self.ram_start_mb
+            self.process.cpu_percent(None)
+        except (psutil.Error, OSError):
+            return
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+        self.sample()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def _monitor_loop(self):
+        while not self._stop_event.wait(self.sample_seconds):
+            self.sample()
+
+    def sample(self):
+        """
+        Toma una lectura puntual de RAM/CPU/GPU.
+        """
+        if self.process is None:
+            return
+
+        try:
+            memory_mb = self.process.memory_info().rss / (1024 ** 2)
+            self.peak_ram_mb = max(self.peak_ram_mb, memory_mb)
+
+            cpu = self.process.cpu_percent(None)
+            self.cpu_samples.append(cpu)
+            self.cpu_peak_percent = max(self.cpu_peak_percent, cpu)
+        except (psutil.Error, OSError):
+            return
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                gpu_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                self.gpu_peak_mb = max(self.gpu_peak_mb, gpu_mb)
+        except Exception:
+            pass
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread.join(timeout=self.sample_seconds + 1)
+            self._thread = None
+        self.sample()
+
+    def snapshot(self):
+        self.stop()
+
+        total_seconds = (
+            time.perf_counter() - self.start_time
+            if self.start_time is not None
+            else 0.0
+        )
+        cpu_avg = (
+            sum(self.cpu_samples) / len(self.cpu_samples)
+            if self.cpu_samples else 0.0
+        )
+
+        return {
+            "total_seconds": round(total_seconds, 3),
+            "ram_start_mb": round(self.ram_start_mb, 2),
+            "ram_peak_mb": round(self.peak_ram_mb, 2),
+            "ram_end_mb": round(self._current_ram_mb(), 2),
+            "cpu_avg_percent": round(cpu_avg, 2),
+            "cpu_peak_percent": round(self.cpu_peak_percent, 2),
+            "gpu_peak_mb": round(self.gpu_peak_mb, 2),
+        }
+
+    def _current_ram_mb(self):
+        if self.process is None:
+            return 0.0
+        try:
+            return self.process.memory_info().rss / (1024 ** 2)
+        except (psutil.Error, OSError):
+            return self.peak_ram_mb
 
 
 # ==============================================================================
@@ -278,6 +441,8 @@ def download_video(job):
     Devuelve una tupla (éxito, mensaje_de_error).
     """
     try:
+        job.local_video.parent.mkdir(parents=True, exist_ok=True)
+
         subprocess.run(
             [
                 RCLONE_CMD,
@@ -291,10 +456,18 @@ def download_video(job):
             check=True,
             capture_output=True,
             text=True,
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
         )
         return True, ""
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"timeout de descarga superado "
+            f"({DOWNLOAD_TIMEOUT_SECONDS} segundos)"
+        )
     except subprocess.CalledProcessError as error:
         return False, (error.stderr or "").strip()
+    except Exception as error:  # nunca debe matar el hilo
+        return False, f"error_inesperado: {error!r}"
 
 
 def extract_frames(video_path: Path, output_folder: Path, wanted=None, stride=1):
@@ -589,7 +762,7 @@ def iter_jobs(remote_files, args, stats):
                 log_result(
                     stats,
                     rel,
-                    "no_procesado",
+                    "omitido",
                     "resultado_existente",
                     result_json=json_output_path,
                 )
@@ -707,9 +880,8 @@ def iter_jobs(remote_files, args, stats):
 
 def process_job(job, inference, args, stats):
     """
-    Ejecuta el flujo completo de procesamiento (extracción, detección y clasificación) para un Job.
-    Guarda los resultados finales en JSON, registra el resultado en el CSV de metadatos
-    y limpia los archivos temporales de video y frames generados.
+    Ejecuta el flujo completo de procesamiento para un Job.
+    Registra tiempos por etapa y métricas de recursos del proceso.
     """
     print("\n" + "-" * 70)
     print(f"Video {job.number}/{job.total}")
@@ -717,19 +889,30 @@ def process_job(job, inference, args, stats):
     print("-" * 70)
 
     saved_detection_path = None
+    benchmark = BenchmarkMonitor()
+    benchmark.start()
 
     try:
+        benchmark.sample()
+
         print("Extrayendo frames...")
+        extract_start = time.perf_counter()
         num_frames = extract_frames(
             job.local_video,
             FRAMES_DIR,
             wanted=job.wanted,
             stride=args.stride,
         )
+        extract_seconds = time.perf_counter() - extract_start
+        benchmark.sample()
         print(f"Extraídos {num_frames} frames.")
+
+        megadetector_seconds = 0.0
 
         if args.md:
             print("\nEjecutando MegaDetector...")
+            md_start = time.perf_counter()
+
             saved_detection_path = expected_detection_path(job.remote_file)
 
             detection_path = (
@@ -749,6 +932,8 @@ def process_job(job, inference, args, stats):
                 saved_detection_path = None
 
             to_classify = images_to_classify(detector_results)
+            megadetector_seconds = time.perf_counter() - md_start
+            benchmark.sample()
 
         else:
             with job.md_json_path.open("r", encoding="utf-8") as file:
@@ -757,7 +942,20 @@ def process_job(job, inference, args, stats):
             to_classify = images_to_classify(detector_results)
             saved_detection_path = job.md_json_path
 
+        detections = sum(
+            len(image.get("detections") or [])
+            for image in detector_results.get("images", [])
+        )
+
+        classified_detections = sum(
+            1
+            for image in to_classify
+            for detection in (image.get("detections") or [])
+            if detection.get("conf", 0) >= CLASSIFY_THRESHOLD
+        )
+
         print("\nEjecutando SpeciesNet...")
+        speciesnet_start = time.perf_counter()
 
         job.json_output_path.parent.mkdir(
             parents=True,
@@ -771,9 +969,33 @@ def process_job(job, inference, args, stats):
             job.json_output_path,
         )
 
+        speciesnet_seconds = time.perf_counter() - speciesnet_start
+        benchmark.sample()
+
+        metrics = benchmark.snapshot()
+        processing_seconds = metrics["total_seconds"]
+        metrics.update({
+            "download_seconds": round(getattr(job, "download_seconds", 0.0), 3),
+            "total_seconds": round(
+                getattr(job, "download_seconds", 0.0) + processing_seconds, 3
+            ),
+            "extract_seconds": round(extract_seconds, 3),
+            "megadetector_seconds": round(megadetector_seconds, 3),
+            "speciesnet_seconds": round(speciesnet_seconds, 3),
+            "processing_seconds": round(processing_seconds, 3),
+            "frames_extracted": num_frames,
+            "detections": detections,
+            "classified_detections": classified_detections,
+        })
+
         print(
             f"Resultados guardados en:\n"
             f"{job.json_output_path.resolve()}"
+        )
+        print(
+            f"Benchmark | total={metrics['total_seconds']:.2f}s | "
+            f"RAM pico={metrics['ram_peak_mb']:.1f} MB | "
+            f"CPU promedio={metrics['cpu_avg_percent']:.1f}%"
         )
 
         log_result(
@@ -782,9 +1004,11 @@ def process_job(job, inference, args, stats):
             "procesado",
             detection_json=saved_detection_path,
             result_json=job.json_output_path,
+            metrics=metrics,
         )
 
     except Exception as error:
+        metrics = benchmark.snapshot()
         print(
             f"Error durante el procesamiento: "
             f"{type(error).__name__}: {error}"
@@ -797,6 +1021,7 @@ def process_job(job, inference, args, stats):
             f"error_procesamiento: {type(error).__name__}: {error}",
             detection_json=saved_detection_path,
             result_json=job.json_output_path,
+            metrics=metrics,
         )
 
     finally:
@@ -881,6 +1106,8 @@ def process_videos(args):
                 download_ok = False
                 download_message = ""
 
+                download_start = time.perf_counter()
+
                 try:
                     download_ok, download_message = current_future.result()
                 except Exception as error:
@@ -888,7 +1115,10 @@ def process_videos(args):
                         f"{type(error).__name__}: {error}"
                     )
 
+                download_seconds = time.perf_counter() - download_start
+
                 if download_ok:
+                    current.download_seconds = download_seconds
                     try:
                         process_job(
                             current,
@@ -931,6 +1161,10 @@ def process_videos(args):
                         "no_procesado",
                         reason,
                         detection_json=current.md_json_path,
+                        metrics={
+                            "download_seconds": round(download_seconds, 3),
+                            "total_seconds": round(download_seconds, 3),
+                        },
                     )
 
                 # Limpiar el video actual
@@ -978,6 +1212,7 @@ def process_videos(args):
 
     print(
         f"Procesados: {stats['procesado']} | "
+        f"Omitidos: {stats['omitido']} | "
         f"No procesados: {stats['no_procesado']}"
     )
 
