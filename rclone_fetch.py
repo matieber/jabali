@@ -43,10 +43,10 @@ from megadetector.detection import run_md_and_speciesnet as mdsn
 
 REMOTE_FOLDER = "pps:" #Cambiar según el nombre de remoto correspondiente
 
-LOCAL_TEMP_DIR = Path("C:/aux_fotos")
-FRAMES_DIR = Path("C:/aux_fotos")
-RESULTS_DIR = Path("./result")
-DETECTIONS_ROOT = Path("./")
+LOCAL_TEMP_DIR = Path("./rclone_local") # directorio de descarga de rclone
+FRAMES_DIR = Path("./temp_frames") # directorio de almacenamiento de frames de video, modificar a donde sea conveniente
+RESULTS_DIR = Path("./result") # directorio con los .json resultantes del procesamiento
+DETECTIONS_ROOT = Path("./") # directorio con los detection_result.json de cada video
 METADATA_FILE = RESULTS_DIR / "processing_metadata.csv"
 TMP_DETECTIONS = RESULTS_DIR / "_tmp_detections.json"
 
