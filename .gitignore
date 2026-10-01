@@ -14,6 +14,7 @@ env/
 venv/
 
 # archivos temporales/inputs
+data/
 temp_frames/
 FotoTrampeo/
 FotosCamarasTrampas/
