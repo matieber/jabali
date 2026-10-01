@@ -27,6 +27,7 @@ temp_detections.json
 especies_resultados_finales.json
 reporte_detecciones.xlsx
 resultados_deteccion.json
+*.html
 
 # tests locales
 temp_frames_v1/
