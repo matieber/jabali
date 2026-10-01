@@ -43,8 +43,8 @@ from megadetector.detection import run_md_and_speciesnet as mdsn
 
 REMOTE_FOLDER = "pps:" #Cambiar según el nombre de remoto correspondiente
 
-LOCAL_TEMP_DIR = Path("./rclone_local")
-FRAMES_DIR = Path("./temp_frames")
+LOCAL_TEMP_DIR = Path("C:/aux_fotos")
+FRAMES_DIR = Path("C:/aux_fotos")
 RESULTS_DIR = Path("./result")
 DETECTIONS_ROOT = Path("./")
 METADATA_FILE = RESULTS_DIR / "processing_metadata.csv"
@@ -57,12 +57,10 @@ METADATA_FIELDS = [
     "reason",
     "detection_json",
     "result_json",
-    "download_seconds",
     "extract_seconds",
     "megadetector_seconds",
     "speciesnet_seconds",
     "processing_seconds",
-    "total_seconds",
     "frames_extracted",
     "detections",
     "classified_detections",
@@ -182,6 +180,15 @@ def normalize_video_path(video_path) -> Path:
     return Path(str(video_path).lstrip("/\\"))
 
 
+def build_remote_source(remote_file) -> str:
+    """
+    Construye la ruta completa de rclone (REMOTE_FOLDER + ruta del video).
+    """
+    base = REMOTE_FOLDER.rstrip("/\\")
+    relative = str(remote_file).lstrip("/\\")
+    return f"{base}/{relative}"
+
+
 def expected_detection_path(video_path) -> Path:
     """ 
     Genera la ruta esperada para el archivo de detection results.
@@ -205,16 +212,7 @@ def find_detection_json(video_path):
 
 
 def safe_output_path(file_path: Path) -> Path:
-    # === CAMBIO PRIORIDAD 4 ===
-    # Conserva la estructura relativa del remoto dentro de result/.
-    #
-    # Ejemplo:
-    #   SL001/20240905/DCIM/100_BTCF/IMG_001.MP4
-    # pasa a:
-    #   result/SL001/20240905/DCIM/100_BTCF/IMG_001.json
     return RESULTS_DIR / file_path.with_suffix(".json")
-
-
 
 
 def frame_index_from_name(name):
@@ -245,7 +243,7 @@ def images_to_classify(detector_results):
 
 
 # ==============================================================================
-# METADATOS
+# METADATOS PARA BENCHMARK
 # ==============================================================================
 
 
@@ -259,8 +257,23 @@ def log_result(
     metrics=None,
 ):
     """Registra el estado final y las métricas de un video en el CSV."""
-    is_new = not METADATA_FILE.exists()
     metrics = metrics or {}
+
+    is_new = not METADATA_FILE.exists()
+    if not is_new:
+        try:
+            with METADATA_FILE.open("r", newline="", encoding="utf-8") as existing:
+                reader = csv.reader(existing)
+                existing_header = next(reader, [])
+        except (OSError, UnicodeError):
+            existing_header = []
+
+        if existing_header != METADATA_FIELDS:
+            backup = METADATA_FILE.with_name(
+                f"{METADATA_FILE.stem}_legacy_{time.strftime('%Y%m%d_%H%M%S')}{METADATA_FILE.suffix}"
+            )
+            METADATA_FILE.replace(backup)
+            is_new = True
 
     with METADATA_FILE.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=METADATA_FIELDS)
@@ -284,7 +297,7 @@ def log_result(
 
 
 class BenchmarkMonitor:
-    """Mide tiempo, CPU, RAM y VRAM del proceso durante un video."""
+    """Mide tiempo, CPU, RAM y VRAM del proceso durante el procesamiento de un video."""
 
     def __init__(self, sample_seconds=BENCHMARK_SAMPLE_SECONDS):
         self.process = psutil.Process(os.getpid()) if psutil else None
@@ -363,7 +376,7 @@ class BenchmarkMonitor:
     def snapshot(self):
         self.stop()
 
-        total_seconds = (
+        processing_seconds = (
             time.perf_counter() - self.start_time
             if self.start_time is not None
             else 0.0
@@ -374,7 +387,7 @@ class BenchmarkMonitor:
         )
 
         return {
-            "total_seconds": round(total_seconds, 3),
+            "processing_seconds": round(processing_seconds, 3),
             "ram_start_mb": round(self.ram_start_mb, 2),
             "ram_peak_mb": round(self.peak_ram_mb, 2),
             "ram_end_mb": round(self._current_ram_mb(), 2),
@@ -400,7 +413,7 @@ class BenchmarkMonitor:
 def load_video_list(list_path: Path):
     """
     Carga y filtra las rutas de un archivo de texto con la lista de videos.
-    Retorna únicamente las líneas no vacías cuyas extensiones coincidan con VIDEO_EXTS.
+    Retorna únicamente las líneas no vacías con extensiones que coincidan con VIDEO_EXTS.
     Lanza FileNotFoundError si el archivo no existe.
     """
     if not list_path.exists():
@@ -473,7 +486,8 @@ def download_video(job):
 def extract_frames(video_path: Path, output_folder: Path, wanted=None, stride=1):
     """
     Extrae fotogramas en formato JPG nombrándolos por su índice real (`frame_XXXXXX.jpg`).
-    Permite filtrar por un conjunto específico de índices (`wanted`) o por intervalo (`stride`).
+    Permite filtrar por un conjunto específico de índices (`wanted`) o por intervalo (`stride`) según
+    si se usa --md o no.
     Devuelve la cantidad total de fotogramas guardados.
     """
     cap = cv2.VideoCapture(str(video_path))
@@ -572,7 +586,6 @@ def build_output(detector_results, classification_results, classifier_model):
 class PersistentInference:
     """
     Gestiona la carga persistente e inferencia con MegaDetector y SpeciesNet.
-    Evita recargar los modelos en memoria entre procesamientos consecutivos.
     """
     def __init__(self, use_md: bool):
         """ Inicializa MD (opcional) y SpeciesNet."""
@@ -618,7 +631,7 @@ class PersistentInference:
             results.extend(
                 self.detector.generate_detections_one_batch(
                     images_np,
-                    [p.name for p in batch],  # solo el nombre del archivo
+                    [p.name for p in batch],  # solamente el nombre del archivo
                     detection_threshold=DEFAULT_OUTPUT_CONFIDENCE_THRESHOLD,
                     augment=False,
                     image_size=None,
@@ -706,8 +719,10 @@ class PersistentInference:
             except Empty:
                 continue
 
-        producer.join(timeout=30)
-        consumer.join(timeout=30)
+        producer.join()
+        consumer.join()
+        check_errors()
+
         return classification_results
 
     # ------------------------------------------------------------------
@@ -853,10 +868,7 @@ def iter_jobs(remote_files, args, stats):
                 number=number,
                 total=total,
                 remote_file=remote_file,
-                remote_source=(
-                    f"{REMOTE_FOLDER.rstrip('/\\\\')}/"
-                    f"{str(remote_file).lstrip('/\\\\')}"
-                ),
+                remote_source=build_remote_source(remote_file),
                 local_video=local_video,
                 json_output_path=json_output_path,
                 md_json_path=md_json_path,
@@ -887,14 +899,14 @@ def process_job(job, inference, args, stats):
     print(f"Video {job.number}/{job.total}")
     print(f"Procesando: {job.remote_file}")
     print("-" * 70)
-
+ 
     saved_detection_path = None
     benchmark = BenchmarkMonitor()
     benchmark.start()
-
+ 
     try:
         benchmark.sample()
-
+ 
         print("Extrayendo frames...")
         extract_start = time.perf_counter()
         num_frames = extract_frames(
@@ -906,98 +918,92 @@ def process_job(job, inference, args, stats):
         extract_seconds = time.perf_counter() - extract_start
         benchmark.sample()
         print(f"Extraídos {num_frames} frames.")
-
+ 
         megadetector_seconds = 0.0
-
+ 
         if args.md:
             print("\nEjecutando MegaDetector...")
             md_start = time.perf_counter()
-
+ 
             saved_detection_path = expected_detection_path(job.remote_file)
-
+ 
             detection_path = (
                 saved_detection_path
                 if args.save_detections
                 else TMP_DETECTIONS
             )
-
+ 
             detector_results = inference.run_md(
                 FRAMES_DIR,
                 detection_path,
                 args.batch_size,
             )
-
+ 
             if not args.save_detections:
                 TMP_DETECTIONS.unlink(missing_ok=True)
                 saved_detection_path = None
-
+ 
             to_classify = images_to_classify(detector_results)
             megadetector_seconds = time.perf_counter() - md_start
             benchmark.sample()
-
+ 
         else:
             with job.md_json_path.open("r", encoding="utf-8") as file:
                 detector_results = json.load(file)
-
+ 
             to_classify = images_to_classify(detector_results)
             saved_detection_path = job.md_json_path
-
+ 
         detections = sum(
             len(image.get("detections") or [])
             for image in detector_results.get("images", [])
         )
-
+ 
         classified_detections = sum(
             1
             for image in to_classify
             for detection in (image.get("detections") or [])
             if detection.get("conf", 0) >= CLASSIFY_THRESHOLD
         )
-
+ 
         print("\nEjecutando SpeciesNet...")
         speciesnet_start = time.perf_counter()
-
+ 
         job.json_output_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
-
+ 
         inference.finalize(
             detector_results,
             to_classify,
             FRAMES_DIR,
             job.json_output_path,
         )
-
+ 
         speciesnet_seconds = time.perf_counter() - speciesnet_start
         benchmark.sample()
-
+ 
         metrics = benchmark.snapshot()
-        processing_seconds = metrics["total_seconds"]
         metrics.update({
-            "download_seconds": round(getattr(job, "download_seconds", 0.0), 3),
-            "total_seconds": round(
-                getattr(job, "download_seconds", 0.0) + processing_seconds, 3
-            ),
             "extract_seconds": round(extract_seconds, 3),
             "megadetector_seconds": round(megadetector_seconds, 3),
             "speciesnet_seconds": round(speciesnet_seconds, 3),
-            "processing_seconds": round(processing_seconds, 3),
             "frames_extracted": num_frames,
             "detections": detections,
             "classified_detections": classified_detections,
         })
-
+ 
         print(
             f"Resultados guardados en:\n"
             f"{job.json_output_path.resolve()}"
         )
         print(
-            f"Benchmark | total={metrics['total_seconds']:.2f}s | "
+            f"Benchmark | procesamiento={metrics['processing_seconds']:.2f}s | "
             f"RAM pico={metrics['ram_peak_mb']:.1f} MB | "
             f"CPU promedio={metrics['cpu_avg_percent']:.1f}%"
         )
-
+ 
         log_result(
             stats,
             job.remote_file,
@@ -1006,14 +1012,14 @@ def process_job(job, inference, args, stats):
             result_json=job.json_output_path,
             metrics=metrics,
         )
-
+ 
     except Exception as error:
         metrics = benchmark.snapshot()
         print(
             f"Error durante el procesamiento: "
             f"{type(error).__name__}: {error}"
         )
-
+ 
         log_result(
             stats,
             job.remote_file,
@@ -1023,10 +1029,16 @@ def process_job(job, inference, args, stats):
             result_json=job.json_output_path,
             metrics=metrics,
         )
-
+ 
     finally:
-        job.local_video.unlink(missing_ok=True)
-        clear_directory(FRAMES_DIR)
+        try:
+            job.local_video.unlink(missing_ok=True)
+            clear_directory(FRAMES_DIR)
+        except OSError as error:
+            print(
+                f"Advertencia: no se pudo limpiar temporales de "
+                f"{job.remote_file}: {error}"
+            )
 
 
 def process_videos(args):
@@ -1106,8 +1118,6 @@ def process_videos(args):
                 download_ok = False
                 download_message = ""
 
-                download_start = time.perf_counter()
-
                 try:
                     download_ok, download_message = current_future.result()
                 except Exception as error:
@@ -1115,10 +1125,7 @@ def process_videos(args):
                         f"{type(error).__name__}: {error}"
                     )
 
-                download_seconds = time.perf_counter() - download_start
-
                 if download_ok:
-                    current.download_seconds = download_seconds
                     try:
                         process_job(
                             current,
@@ -1161,10 +1168,6 @@ def process_videos(args):
                         "no_procesado",
                         reason,
                         detection_json=current.md_json_path,
-                        metrics={
-                            "download_seconds": round(download_seconds, 3),
-                            "total_seconds": round(download_seconds, 3),
-                        },
                     )
 
                 # Limpiar el video actual
@@ -1184,7 +1187,7 @@ def process_videos(args):
                 upcoming_future = None
 
     finally:
-        # Limpieza global ante cualquier excepción inesperada
+        # Limpieza global por si hay alguna excepción inesperada
         for job in (current, upcoming):
             if job is None:
                 continue
@@ -1220,7 +1223,7 @@ def main():
     args = parse_args()
 
     print("=" * 70)
-    print("PIPELINE MD + SpeciesNet")
+    print("PIPELINE MD + SpeciesNet para videos extraibles usando rclone")
     print("=" * 70)
     print(f"\nPlataforma: {sys.platform}")
     print(f"Rclone: {RCLONE_CMD}")
