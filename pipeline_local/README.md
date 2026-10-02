@@ -1,5 +1,3 @@
-## Documentación
-  https://drive.google.com/drive/folders/1BDjeB0_tliaYmY3Q7sRNUsPtXjNfCtlc?usp=sharing
 
 ## Ejecución
 * 1 - Configurar las rutas en `preprocesamiento.py`
