@@ -1,5 +1,6 @@
 ﻿megadetector==10.0.25
 speciesnet==5.0.5
+opencv-python
 psutil
 
 
