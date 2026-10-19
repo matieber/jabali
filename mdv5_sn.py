@@ -36,8 +36,7 @@ from megadetector.detection.run_detector import (
 from megadetector.detection.run_detector_batch import write_results_to_file
 
 # Reutilizamos la implementación de SpeciesNet para el procesamiento de crops
-# y la generación de clasificaciones. Habria que ver si fijar la versión de md 
-# para asi evitamos problemas por diferencias entre versiones
+# y la generación de clasificaciones. 
 from megadetector.detection import run_md_and_speciesnet as mdsn
 
 # ==============================================================================
@@ -48,9 +47,13 @@ REMOTE_FOLDER = "pps:" #Cambiar según el nombre de remoto correspondiente
 
 LOCAL_TEMP_DIR = Path("./data/rclone_local") # directorio de descarga de rclone
 FRAMES_DIR = Path("./data/temp_frames") # directorio de almacenamiento de frames de video, modificar a donde sea conveniente
-RESULTS_DIR = Path("./data/result") # directorio con los .json resultantes del procesamiento
-DETECTIONS_ROOT = Path("./data") # directorio con los detection_result.json de cada video
-METADATA_FILE = RESULTS_DIR / "processing_metadata.csv"
+RESULTS_DIR = Path("./data/result") # directorio raíz de las salidas del procesamiento
+CLASSIFICATIONS_DIR = RESULTS_DIR / "classifications" # json finales de clasificación (MegaDetector + SpeciesNet)
+METADATA_DIR = RESULTS_DIR / "metadata" # CSV con estado y métricas de cada video
+DETECTIONS_OUTPUT_DIR = RESULTS_DIR / "detections" # detection_results.json guardados con --save-detections / --md-only
+DETECTIONS_ROOT = Path("./data/detections") # entrada con los json donde se leen los detection_results.json al correr sin --md
+LOCAL_SOURCE_DIR = Path("./data/videos") # directorio local con los videos a procesar
+METADATA_FILE = METADATA_DIR / "processing_metadata.csv"
 TMP_DETECTIONS = RESULTS_DIR / "_tmp_detections.json"
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov"}
@@ -140,7 +143,7 @@ def parse_args():
         action="store_true",
         help=(
             "Solo con --md: guarda el detection_results.json de cada video en "
-            "DETECTIONS_ROOT/<ruta_sin_extension>/ para reutilizarlo sin --md."
+            "DETECTIONS_OUTPUT_DIR/<ruta_sin_extension>/ (result/detections)."
         ),
     )
     parser.add_argument(
@@ -153,11 +156,40 @@ def parse_args():
     action="store_true",
     help="Fuerza CPU: oculta la GPU para MegaDetector y SpeciesNet.",
     )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "Procesa videos desde un directorio local (LOCAL_SOURCE_DIR) sin usar "
+            "rclone. Con --list-paths, las rutas se interpretan desde ese directorio."
+        ),
+    )
+    parser.add_argument(
+        "--local-dir",
+        type=Path,
+        default=None,
+        help="Directorio local de videos (sobrescribe LOCAL_SOURCE_DIR). Implica --local.",
+    )
+    parser.add_argument(
+        "--md-only",
+        action="store_true",
+        help=(
+            "Ejecuta solo MegaDetector: implica --md y --save-detections, "
+            "no carga SpeciesNet y no genera el JSON final de clasificación."
+        ),
+    )
     args = parser.parse_args()
     
 
     if args.stride < 1 or args.batch_size < 1:
         parser.error("--stride y --batch-size deben ser >= 1")
+
+    if args.local_dir is not None:
+        args.local = True
+
+    if args.md_only:
+        args.md = True
+        args.save_detections = True
 
     return args
 
@@ -167,28 +199,51 @@ def parse_args():
 # ==============================================================================
 
 
-def prepare_directories():
+def prepare_directories(local=False):
     """ Crea los directorios auxiliares para el procesamiento. """
-    for directory in (LOCAL_TEMP_DIR, FRAMES_DIR, RESULTS_DIR):
+    directories = [
+        FRAMES_DIR,
+        RESULTS_DIR,
+        CLASSIFICATIONS_DIR,
+        METADATA_DIR,
+        DETECTIONS_OUTPUT_DIR,
+    ]
+    if not local:
+        directories.append(LOCAL_TEMP_DIR)
+    for directory in directories:
         directory.mkdir(exist_ok=True, parents=True)
 
 
-def check_dependencies():
+def check_dependencies(local=False):
     """ Revisa que rclone se encuentre en el Path del sistema como comando. """
+    if local:
+        if not LOCAL_SOURCE_DIR.is_dir():
+            raise RuntimeError(
+                f"No existe el directorio local de videos: {LOCAL_SOURCE_DIR.resolve()}"
+            )
+        return
+
     if RCLONE_CMD is None:
         raise RuntimeError("No se encontró 'rclone' en el PATH del sistema.")
 
 
 def clear_directory(directory: Path):
-    """ Elimina un directorio junto con su contenido. """
+    """Elimina el directorio temporal y lo vuelve a crear vacío."""
     if directory.exists():
         shutil.rmtree(directory)
     directory.mkdir(parents=True, exist_ok=True)
 
 
 def normalize_video_path(video_path) -> Path:
-    """ Quita separadores iniciales para que Path() no descarte componentes."""
-    return Path(str(video_path).lstrip("/\\"))
+    """Normaliza una ruta relativa y rechaza rutas absolutas."""
+    raw = str(video_path).strip().replace("\\", "/")
+    raw = raw.lstrip("/")
+    if not raw or (len(raw) >= 2 and raw[1] == ":"):
+        raise ValueError(f"Se esperaba una ruta relativa de video: {video_path!r}")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"Ruta de video no válida: {video_path!r}")
+    return Path(*parts)
 
 
 def build_remote_source(remote_file) -> str:
@@ -197,7 +252,10 @@ def build_remote_source(remote_file) -> str:
     """
     base = REMOTE_FOLDER.rstrip("/\\")
     relative = str(remote_file).lstrip("/\\")
-    return f"{base}/{relative}"
+    if not relative:
+        raise ValueError("La ruta relativa del video está vacía.")
+    separator = "" if base.endswith(":") else "/"
+    return f"{base}{separator}{relative}"
 
 
 def expected_detection_path(video_path) -> Path:
@@ -206,9 +264,19 @@ def expected_detection_path(video_path) -> Path:
     Construye la ruta ubicando 'detection_results.json' dentro de un directorio
     dedicado con el nombre del video (sin extensión), conservando la estructura 
     de carpetas relativa a DETECTIONS_ROOT.
+    Se usa para leer detecciones al correr sin --md.
     """
     rel = normalize_video_path(video_path)
     return DETECTIONS_ROOT / rel.parent / rel.stem / "detection_results.json"
+
+
+def output_detection_path(video_path) -> Path:
+    """
+    Genera la ruta de salida donde se guarda el detection_results.json
+    (--save-detections / --md-only), relativa a DETECTIONS_OUTPUT_DIR.
+    """
+    rel = normalize_video_path(video_path)
+    return DETECTIONS_OUTPUT_DIR / rel.parent / rel.stem / "detection_results.json"
 
 
 def find_detection_json(video_path):
@@ -223,7 +291,8 @@ def find_detection_json(video_path):
 
 
 def safe_output_path(file_path: Path) -> Path:
-    return RESULTS_DIR / file_path.with_suffix(".json")
+    """ Ruta del JSON final de clasificación, dentro de CLASSIFICATIONS_DIR. """
+    return CLASSIFICATIONS_DIR / file_path.with_suffix(".json")
 
 
 def frame_index_from_name(name):
@@ -269,6 +338,8 @@ def log_result(
 ):
     """Registra el estado final y las métricas de un video en el CSV."""
     metrics = metrics or {}
+
+    METADATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     is_new = not METADATA_FILE.exists()
     if not is_new:
@@ -457,11 +528,31 @@ def load_video_list(list_path: Path):
             f"No existe el archivo de lista de videos: {list_path.resolve()}"
         )
     with list_path.open("r", encoding="utf-8") as file:
-        return [
-            line.strip()
-            for line in file
-            if line.strip() and Path(line.strip()).suffix.lower() in VIDEO_EXTS
-        ]
+        videos = []
+        for line in file:
+            value = line.strip()
+            if not value:
+                continue
+            try:
+                relative = normalize_video_path(value)
+            except ValueError as error:
+                raise ValueError(f"Ruta inválida en {list_path}: {value!r}") from error
+            if relative.suffix.lower() in VIDEO_EXTS:
+                videos.append(relative.as_posix())
+        return videos
+
+
+def find_local_videos(root: Path):
+    """
+    Lista recursivamente los videos de un directorio local.
+    Retorna rutas relativas a `root` (con '/'), equivalentes a las del remoto.
+    """
+    print(f"\nBuscando videos en {root.resolve()}...")
+    return sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTS
+    )
 
 
 def find_remote_videos():
@@ -489,6 +580,12 @@ def download_video(job):
     Descarga el video de un job desde el remoto al almacenamiento local usando rclone.
     Devuelve una tupla (éxito, mensaje_de_error).
     """
+    # si es local
+    if not job.is_temp:
+        if job.local_video.is_file():
+            return True, ""
+        return False, f"archivo local no encontrado: {job.local_video}"
+
     try:
         job.local_video.parent.mkdir(parents=True, exist_ok=True)
 
@@ -515,7 +612,7 @@ def download_video(job):
         )
     except subprocess.CalledProcessError as error:
         return False, (error.stderr or "").strip()
-    except Exception as error:  # nunca debe matar el hilo
+    except Exception as error: 
         return False, f"error_inesperado: {error!r}"
 
 
@@ -623,9 +720,12 @@ class PersistentInference:
     """
     Gestiona la carga persistente e inferencia con MegaDetector y SpeciesNet.
     """
-    def __init__(self, use_md: bool):
+    def __init__(self, use_md: bool, load_classifier: bool = True):
         """ Inicializa MD (opcional) y SpeciesNet."""
         self.detector = None
+        self.classifier_model = None
+        self.producer_classifier = None
+        self.consumer_classifier = None
 
         if use_md:
             print("\nCargando MegaDetector...")
@@ -636,6 +736,10 @@ class PersistentInference:
                 model_file, force_model_download=False, detector_options={}
             )
             print("MegaDetector cargado.")
+
+        # Con --md-only no se carga SpeciesNet.
+        if not load_classifier:
+            return
 
         # Dos instancias, una para preprocessing en CPU y otra para inferencia.
         print("\nCargando SpeciesNet...")
@@ -667,7 +771,7 @@ class PersistentInference:
             results.extend(
                 self.detector.generate_detections_one_batch(
                     images_np,
-                    [p.name for p in batch],  # solamente el nombre del archivo
+                    [p.name for p in batch], 
                     detection_threshold=DEFAULT_OUTPUT_CONFIDENCE_THRESHOLD,
                     augment=False,
                     image_size=None,
@@ -793,6 +897,7 @@ class Job:
     json_output_path: Path
     md_json_path: Path = None        # sin --md
     wanted: set = None               # frames a extraer (None = según stride)
+    is_temp: bool = True             # False en --local
 
 
 def iter_jobs(remote_files, args, stats):
@@ -806,10 +911,21 @@ def iter_jobs(remote_files, args, stats):
     for number, remote_file in enumerate(remote_files, 1):
         try:
             rel = normalize_video_path(remote_file)
-            local_video = LOCAL_TEMP_DIR / rel
+            local_video = (LOCAL_SOURCE_DIR if args.local else LOCAL_TEMP_DIR) / rel
             json_output_path = safe_output_path(rel)
 
-            if json_output_path.exists() and not args.force:
+            if args.md_only:
+                existing_detection = output_detection_path(rel)
+                if existing_detection.exists() and not args.force:
+                    log_result(
+                        stats,
+                        rel,
+                        "omitido",
+                        "deteccion_existente",
+                        detection_json=existing_detection,
+                    )
+                    continue
+            elif json_output_path.exists() and not args.force:
                 log_result(
                     stats,
                     rel,
@@ -823,7 +939,6 @@ def iter_jobs(remote_files, args, stats):
             wanted = None
 
             if not args.md:
-                # find_detection_json devuelve (Path, None) o (None, motivo).
                 md_json_path, reason = find_detection_json(rel)
 
                 if md_json_path is None:
@@ -843,8 +958,6 @@ def iter_jobs(remote_files, args, stats):
                     to_classify = images_to_classify(detector_results)
 
                     if not to_classify:
-                        # No hay frames que clasificar, no hace falta descargar
-                        # el video. Se genera directamente el resultado final
                         json_output_path.parent.mkdir(
                             parents=True,
                             exist_ok=True,
@@ -876,12 +989,8 @@ def iter_jobs(remote_files, args, stats):
                         for image in to_classify
                     ]
 
-                    # Si algún nombre no tiene el formato esperado,
-                    # se extraen todos los frames.
                     wanted = None if None in indices else set(indices)
 
-                    # Evita conservar el JSON completo mientras el generador
-                    # queda suspendido en yield.
                     del detector_results
                     del to_classify
                     del indices
@@ -904,11 +1013,14 @@ def iter_jobs(remote_files, args, stats):
                 number=number,
                 total=total,
                 remote_file=remote_file,
-                remote_source=build_remote_source(remote_file),
+                remote_source=(
+                    str(local_video) if args.local else build_remote_source(remote_file)
+                ),
                 local_video=local_video,
                 json_output_path=json_output_path,
                 md_json_path=md_json_path,
                 wanted=wanted,
+                is_temp=not args.local,
             )
 
         except Exception as error:
@@ -949,7 +1061,7 @@ def process_job(job, inference, args, stats):
             job.local_video,
             FRAMES_DIR,
             wanted=job.wanted,
-            stride=args.stride,
+            stride=args.stride if args.md else 1,
         )
         extract_seconds = time.perf_counter() - extract_start
         benchmark.sample()
@@ -962,7 +1074,7 @@ def process_job(job, inference, args, stats):
             print("\nEjecutando MegaDetector...")
             md_start = time.perf_counter()
  
-            saved_detection_path = expected_detection_path(job.remote_file)
+            saved_detection_path = output_detection_path(job.remote_file)
  
             detection_path = (
                 saved_detection_path
@@ -999,6 +1111,40 @@ def process_job(job, inference, args, stats):
             for image in detector_results.get("images", [])
         )
  
+        if args.md_only:
+            metrics = benchmark.snapshot()
+            metrics.update({
+                "extract_seconds": round(extract_seconds, 3),
+                "megadetector_seconds": round(megadetector_seconds, 3),
+                "speciesnet_seconds": 0.0,
+                "frames_extracted": num_frames,
+                "detections": detections,
+                "classified_detections": 0,
+                "megadetector_gpu_peak_mb": round(megadetector_gpu_peak_mb, 2),
+                "speciesnet_gpu_peak_mb": 0.0,
+            })
+
+            print(
+                f"Detecciones guardadas en:\n"
+                f"{saved_detection_path.resolve()}"
+            )
+            print(
+                f"Benchmark | procesamiento={metrics['processing_seconds']:.2f}s | "
+                f"RAM pico={metrics['ram_peak_mb']:.1f} MB | "
+                f"CPU promedio={metrics['cpu_avg_percent']:.1f}% | "
+                f"VRAM MD={metrics['megadetector_gpu_peak_mb']:.0f} MB"
+            )
+
+            log_result(
+                stats,
+                job.remote_file,
+                "procesado",
+                "solo_megadetector",
+                detection_json=saved_detection_path,
+                metrics=metrics,
+            )
+            return
+
         classified_detections = sum(
             1
             for image in to_classify
@@ -1079,7 +1225,8 @@ def process_job(job, inference, args, stats):
  
     finally:
         try:
-            job.local_video.unlink(missing_ok=True)
+            if job.is_temp:
+                job.local_video.unlink(missing_ok=True)
             clear_directory(FRAMES_DIR)
         except OSError as error:
             print(
@@ -1102,9 +1249,17 @@ def process_videos(args):
             f"\nSe cargaron {len(file_list)} videos desde "
             f"{args.list_paths.resolve()}"
         )
+    elif args.local:
+        file_list = find_local_videos(LOCAL_SOURCE_DIR)
+        print(f"\nSe encontraron {len(file_list)} videos locales para procesar.")
     else:
         file_list = find_remote_videos()
         print(f"\nSe encontraron {len(file_list)} videos para procesar.")
+
+    unique_file_list = list(dict.fromkeys(file_list))
+    if len(unique_file_list) != len(file_list):
+        print(f"Se descartaron {len(file_list) - len(unique_file_list)} rutas duplicadas.")
+    file_list = unique_file_list
 
     if not file_list:
         print("No se encontraron videos.")
@@ -1113,7 +1268,7 @@ def process_videos(args):
     stats = Counter()
 
     # Los modelos se cargan una sola vez
-    inference = PersistentInference(args.md)
+    inference = PersistentInference(args.md, load_classifier=not args.md_only)
 
     jobs = iter_jobs(file_list, args, stats)
 
@@ -1219,7 +1374,7 @@ def process_videos(args):
 
                 # Limpiar el video actual
                 try:
-                    if current.local_video.exists():
+                    if current.is_temp and current.local_video.exists():
                         current.local_video.unlink()
                 except OSError as error:
                     print(
@@ -1240,7 +1395,7 @@ def process_videos(args):
                 continue
 
             try:
-                if job.local_video.exists():
+                if job.is_temp and job.local_video.exists():
                     job.local_video.unlink()
             except OSError:
                 pass
@@ -1251,7 +1406,8 @@ def process_videos(args):
             pass
 
         try:
-            clear_directory(LOCAL_TEMP_DIR)
+            if not args.local:
+                clear_directory(LOCAL_TEMP_DIR)
         except Exception:
             pass
 
@@ -1267,20 +1423,31 @@ def process_videos(args):
     )
 
 def main():
+    global LOCAL_SOURCE_DIR
     args = parse_args()
 
+    if args.local_dir is not None:
+        LOCAL_SOURCE_DIR = args.local_dir
+
     print("=" * 70)
-    print("PIPELINE MD + SpeciesNet para videos extraibles usando rclone")
+    print("PIPELINE MegaDetector + SpeciesNet para videos de cámaras trampa")
     print("=" * 70)
     print(f"\nPlataforma: {sys.platform}")
-    print(f"Rclone: {RCLONE_CMD}")
+    if args.local:
+        print(f"Modo local: {LOCAL_SOURCE_DIR.resolve()}")
+    else:
+        print(f"Rclone: {RCLONE_CMD}")
     print(f"MegaDetector desde cero: {args.md}")
+    print(f"Solo MegaDetector (sin SpeciesNet): {args.md_only}")
     print(f"Forzar CPU: {args.force_cpu}")
     print(f"Lista de videos: {args.list_paths}")
-    print(f"Raíz de detecciones: {DETECTIONS_ROOT.resolve()}")
+    print(f"Raíz de detecciones (entrada): {DETECTIONS_ROOT.resolve()}")
+    print(f"Salida de detecciones: {DETECTIONS_OUTPUT_DIR.resolve()}")
+    print(f"Salida de clasificaciones: {CLASSIFICATIONS_DIR.resolve()}")
+    print(f"Salida de metadatos: {METADATA_DIR.resolve()}")
 
-    prepare_directories()
-    check_dependencies()
+    prepare_directories(args.local)
+    check_dependencies(args.local)
     clear_directory(FRAMES_DIR)
     process_videos(args)
 
