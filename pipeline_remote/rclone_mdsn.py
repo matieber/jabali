@@ -24,6 +24,9 @@ from queue import Empty, Full
 from PIL import Image
 import numpy as np
 
+if "--force-cpu" in sys.argv:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 # MegaDetector
 from megadetector.detection.run_detector import (
     load_detector,
@@ -70,6 +73,8 @@ METADATA_FIELDS = [
     "cpu_avg_percent",
     "cpu_peak_percent",
     "gpu_peak_mb",
+    "megadetector_gpu_peak_mb",
+    "speciesnet_gpu_peak_mb",
 ]
 
 RCLONE_CMD = shutil.which("rclone")
@@ -143,7 +148,13 @@ def parse_args():
         action="store_true",
         help="Reprocesa videos aunque ya exista su JSON de salida.",
     )
+    parser.add_argument(
+    "--force-cpu",
+    action="store_true",
+    help="Fuerza CPU: oculta la GPU para MegaDetector y SpeciesNet.",
+    )
     args = parser.parse_args()
+    
 
     if args.stride < 1 or args.batch_size < 1:
         parser.error("--stride y --batch-size deben ser >= 1")
@@ -296,6 +307,36 @@ def log_result(
     stats[status] += 1
 
 
+def reset_gpu_peak():
+    """
+    Reinicia el contador de pico de VRAM de PyTorch.
+    Se llama justo antes de una etapa para medir su pico de forma aislada.
+    No hace nada si no hay torch o CUDA.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def read_gpu_peak_mb():
+    """
+    Devuelve el pico de VRAM asignada (MB) desde el último reset_gpu_peak().
+    Devuelve 0.0 si no hay torch o CUDA.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated() / (1024 ** 2)
+    except Exception:
+        pass
+    return 0.0
+
+
 class BenchmarkMonitor:
     """Mide tiempo, CPU, RAM y VRAM del proceso durante el procesamiento de un video."""
 
@@ -324,13 +365,7 @@ class BenchmarkMonitor:
         except (psutil.Error, OSError):
             return
 
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-        except Exception:
-            pass
+        reset_gpu_peak()
 
         self.sample()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -357,14 +392,15 @@ class BenchmarkMonitor:
         except (psutil.Error, OSError):
             return
 
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                gpu_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-                self.gpu_peak_mb = max(self.gpu_peak_mb, gpu_mb)
-        except Exception:
-            pass
+        self.gpu_peak_mb = max(self.gpu_peak_mb, read_gpu_peak_mb())
+
+    def register_gpu_peak(self, peak_mb):
+        """
+        Incorpora al pico global de VRAM el pico de una etapa ya medida.
+        Necesario porque reset_gpu_peak() reinicia el contador de PyTorch
+        entre etapas y, sin esto, el pico global perdería la etapa anterior.
+        """
+        self.gpu_peak_mb = max(self.gpu_peak_mb, peak_mb)
 
     def stop(self):
         if self._thread is not None:
@@ -920,6 +956,7 @@ def process_job(job, inference, args, stats):
         print(f"Extraídos {num_frames} frames.")
  
         megadetector_seconds = 0.0
+        megadetector_gpu_peak_mb = 0.0
  
         if args.md:
             print("\nEjecutando MegaDetector...")
@@ -933,11 +970,14 @@ def process_job(job, inference, args, stats):
                 else TMP_DETECTIONS
             )
  
+            reset_gpu_peak()
             detector_results = inference.run_md(
                 FRAMES_DIR,
                 detection_path,
                 args.batch_size,
             )
+            megadetector_gpu_peak_mb = read_gpu_peak_mb()
+            benchmark.register_gpu_peak(megadetector_gpu_peak_mb)
  
             if not args.save_detections:
                 TMP_DETECTIONS.unlink(missing_ok=True)
@@ -974,12 +1014,15 @@ def process_job(job, inference, args, stats):
             exist_ok=True,
         )
  
+        reset_gpu_peak()
         inference.finalize(
             detector_results,
             to_classify,
             FRAMES_DIR,
             job.json_output_path,
         )
+        speciesnet_gpu_peak_mb = read_gpu_peak_mb()
+        benchmark.register_gpu_peak(speciesnet_gpu_peak_mb)
  
         speciesnet_seconds = time.perf_counter() - speciesnet_start
         benchmark.sample()
@@ -992,6 +1035,8 @@ def process_job(job, inference, args, stats):
             "frames_extracted": num_frames,
             "detections": detections,
             "classified_detections": classified_detections,
+            "megadetector_gpu_peak_mb": round(megadetector_gpu_peak_mb, 2),
+            "speciesnet_gpu_peak_mb": round(speciesnet_gpu_peak_mb, 2),
         })
  
         print(
@@ -1001,7 +1046,9 @@ def process_job(job, inference, args, stats):
         print(
             f"Benchmark | procesamiento={metrics['processing_seconds']:.2f}s | "
             f"RAM pico={metrics['ram_peak_mb']:.1f} MB | "
-            f"CPU promedio={metrics['cpu_avg_percent']:.1f}%"
+            f"CPU promedio={metrics['cpu_avg_percent']:.1f}% | "
+            f"VRAM MD={metrics['megadetector_gpu_peak_mb']:.0f} MB | "
+            f"VRAM SN={metrics['speciesnet_gpu_peak_mb']:.0f} MB"
         )
  
         log_result(
@@ -1228,6 +1275,7 @@ def main():
     print(f"\nPlataforma: {sys.platform}")
     print(f"Rclone: {RCLONE_CMD}")
     print(f"MegaDetector desde cero: {args.md}")
+    print(f"Forzar CPU: {args.force_cpu}")
     print(f"Lista de videos: {args.list_paths}")
     print(f"Raíz de detecciones: {DETECTIONS_ROOT.resolve()}")
 
