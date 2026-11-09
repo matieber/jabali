@@ -44,14 +44,19 @@ def is_color_frame(image_path, saturation_threshold=12.0):
     
     return bool(mean_saturation > saturation_threshold)
 
-def process_directory(input_source, out_color="color.out", out_ir="infrared.out", image_range=None, base_dir=None):
+def process_directory(frames_dir, input_list=None, out_color="color.out", out_ir="infrared.out", image_range=None):
     """
     Clasifica las imágenes de un directorio en fotografías a color
     e imágenes infrarrojas (IR), generando archivos .out separados.
 
     **Parámetros**
         frames_dir (str | Path):
-            Ruta del directorio que contiene las imágenes a clasificar.
+            Ruta obligatoria del directorio que contiene las imágenes a clasificar.
+
+        input_list (str | Path, opcional):
+            Ruta de un archivo .out previo con la lista de frames a procesar.
+            Si no se proporciona, se escanean directamente las imágenes del directorio.
+            Por defecto: None.
 
         out_color (str | Path, opcional):
             Ruta del archivo de salida donde se guardarán los nombres
@@ -62,19 +67,22 @@ def process_directory(input_source, out_color="color.out", out_ir="infrared.out"
             Ruta del archivo de salida donde se guardarán los nombres
             de las imágenes clasificadas como infrarrojas (IR).
             Por defecto: "infrared.out".
+
+        image_range (tuple, opcional):
+            Rango numérico de imágenes a procesar.
+            Por defecto: None.
     """
-    source_path = Path(input_source)
+    target_dir = Path(frames_dir)
     color_frames = []
     ir_frames = []
 
-    if source_path.is_file():
-        with open(source_path, "r", encoding="utf-8") as f:
+    if input_list is not None and Path(input_list).is_file():
+        with open(input_list, "r", encoding="utf-8") as f:
             files = [line.strip() for line in f if line.strip()]
         if image_range is not None:
             files = files[image_range[0]:image_range[1]]
         
-        target_dir = Path(base_dir) if base_dir else Path(".")
-        for file_name in tqdm(files, desc="Clasificando desde .out", unit="frame"):
+        for file_name in tqdm(files, desc="Clasificando desde lista", unit="frame"):
             file_path = target_dir / file_name
             is_color = is_color_frame(file_path)
 
@@ -84,7 +92,7 @@ def process_directory(input_source, out_color="color.out", out_ir="infrared.out"
                 ir_frames.append(file_path.name)
     else:
         extension = ".jpg"
-        files = sorted([f for f in source_path.iterdir() if f.suffix.lower() == extension], key=natural_sort_key)
+        files = sorted([f for f in target_dir.iterdir() if f.suffix.lower() == extension], key=natural_sort_key)
 
         if image_range is not None:
             files = files[image_range[0]:image_range[1]]
@@ -103,13 +111,13 @@ def process_directory(input_source, out_color="color.out", out_ir="infrared.out"
     with open(out_ir, "w", encoding="utf-8") as f:
         f.write("\n".join(ir_frames) + ("\n" if ir_frames else ""))
 
-    print(f"  - Frames Color: {len(color_frames)} -> guardados en '{out_color}'")
-    print(f"  - Frames IR:    {len(ir_frames)} -> guardados en '{out_ir}'")
+    print(f"  - Frames Color: {len(color_frames)} -> guardados em '{out_color}'")
+    print(f"  - Frames IR:    {len(ir_frames)} -> guardados em '{out_ir}'")
 
 process_directory(
-    "data/input/jabali_frames",
+    frames_dir="data/input/jabali_frames",
+    input_list=None,
     out_color="color.out",
     out_ir="infrared.out",
-    image_range=(0, 10300)
+    image_range=(0, 10299)
 )
-process_directory("data/input/jabali_frames", out_color= "color.out", out_ir= "infrared.out")

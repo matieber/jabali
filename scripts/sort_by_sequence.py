@@ -174,21 +174,26 @@ def calculate_histogram_similarity(img1_path, img2_path, base_dir=None):
     return float(similarity)
 
 
-def group_sequences(input_source, output_file, base_dir=None, threshold=0.95, image_range=None):
+def group_sequences(frames_dir, input_list=None, output_file="ir_sequences.out", threshold=0.95, image_range=None):
     """
     Agrupa frames consecutivos en secuencias según su similitud visual.
     
     **Parámetros**
-        input_file (str | Path):
-            Ruta del archivo .out que contiene los nombres o rutas
-            de los frames a procesar.
-        output_file (str | Path):
+        frames_dir (str | Path):
+            Ruta obligatoria del directorio base donde se encuentran las imágenes.
+            Se utiliza para construir la ruta completa de cada frame.
+
+        input_list (str | Path, opcional):
+            Ruta de un archivo .out previo que contiene los nombres o rutas
+            de los frames a procesar. Si no se proporciona, se escanean
+            directamente las imágenes del directorio base.
+            Por defecto: None.
+
+        output_file (str | Path, opcional):
             Ruta del archivo de salida donde se guardarán las
             secuencias detectadas.
-        base_dir (str | Path):
-            Directorio base donde se encuentran las imágenes.
-            Se utiliza para construir la ruta completa de cada
-            frame a partir de su nombre o ruta relativa.
+            Por defecto: "ir_sequences.out".
+
         threshold (float, opcional):
             Umbral mínimo de similitud para mantener dos frames
             consecutivos dentro de una misma secuencia.
@@ -196,27 +201,29 @@ def group_sequences(input_source, output_file, base_dir=None, threshold=0.95, im
             una nueva secuencia.
             Su valor debe calibrarse según las características
             de las imágenes y el nivel de variación visual
-            que se desea tolerar. Por defecto: 0.95.
+            que se desea tolerar. Por defecto: 0.4.
+
+        image_range (tuple, opcional):
+            Rango numérico de imágenes a procesar.
+            Por defecto: None.
     """
-    source_path = Path(input_source)
+    base_dir = Path(frames_dir)
     lines = []
 
-    if source_path.is_file():
-        with open(source_path, "r", encoding="utf-8") as f:
+    if input_list is not None and Path(input_list).is_file():
+        with open(input_list, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
-    elif source_path.is_dir():
+    else:
         extension = ".jpg"
-        files = sorted([f.name for f in source_path.iterdir() if f.suffix.lower() == extension], 
+        files = sorted([f.name for f in base_dir.iterdir() if f.suffix.lower() == extension], 
                        key=lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', x)])
         lines = files
-        if base_dir is None:
-            base_dir = source_path
 
     if image_range is not None:
         lines = lines[image_range[0]:image_range[1]]
 
     if not lines:
-        print(f"El origen '{input_source}' está vacío o el rango no contiene elementos.")
+        print(f"El directorio o lista está vacío o el rango no contiene elementos.")
         return
 
     sequences = []
@@ -250,5 +257,17 @@ def group_sequences(input_source, output_file, base_dir=None, threshold=0.95, im
     print(f"  - Secuencias detectadas: {len(sequences)}")
     print(f"  - Resultado guardado en: '{output_file}'")
 
-group_sequences("infrared.out", "ir_sequences.out", base_dir="data/input/jabali_frames", threshold=0.4, image_range=(0,10300))
-group_sequences("color.out", "color_sequences.out", base_dir="data/input/jabali_frames", threshold=0.4, image_range=(0,10300))
+group_sequences(
+    frames_dir="data/input/jabali_frames",
+    input_list="infrared.out",
+    output_file="ir_sequences.out",
+    threshold=0.4,
+    image_range=None
+)
+group_sequences(
+    frames_dir="data/input/jabali_frames",
+    input_list="color.out",
+    output_file="color_sequences.out",
+    threshold=0.4,
+    image_range=None
+)
