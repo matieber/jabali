@@ -1,0 +1,10 @@
+### Python Environments ###
+.venv/
+md_venv/
+pw_venv/
+
+### Data ###
+data/
+*.out
+*.csv
+*.json
